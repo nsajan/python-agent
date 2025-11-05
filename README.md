@@ -30,6 +30,14 @@ functionality to the assistant.
    streamlit run app.py
    ```
 
+## Deployment
+
+The repository includes a `Procfile` so the app can run on platforms like
+Railway or Heroku. When deploying, ensure the environment provides an
+`OPENAI_API_KEY` and launches the web process with the default command. The app
+automatically listens on the `PORT` assigned by the host and binds to
+`0.0.0.0`, so no additional configuration is required.
+
 4. **Add custom tools**
 
    Create Python files in the `tools/` directory. Each file must expose a `TOOL`
