@@ -4,8 +4,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -26,6 +27,10 @@ from toolkit import ToolSpec
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_SYSTEM_PROMPT = (
+    "You are an AI assistant that can run Python helper functions. "
+    "Use the knowledge base provided by the user to ground your replies."
+)
 TOOLS_PATH = Path(__file__).parent / "tools"
 
 
@@ -190,15 +195,30 @@ def render_sidebar(tool_specs: Dict[str, ToolSpec]) -> Dict[str, Any]:
         temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=0.7, step=0.1)
 
         st.markdown("---")
+        st.subheader("Knowledge Base")
+        system_prompt = st.text_area(
+            "System Prompt / Knowledge Base",
+            value=st.session_state.system_prompt,
+            height=200,
+            help="Provide instructions or reference knowledge that every response should follow.",
+        )
+        if system_prompt != st.session_state.system_prompt:
+            st.session_state.system_prompt = system_prompt
+
+        st.markdown("---")
         st.subheader("Available Tools")
         if not tool_specs:
             st.caption("No custom tools found in the tools directory.")
         else:
-            for tool in tool_specs.values():
+            runtime_names = set(st.session_state.runtime_tools.keys())
+            for name in sorted(tool_specs):
+                tool = tool_specs[name]
                 with st.expander(tool.name, expanded=False):
                     st.markdown(f"**Description:** {tool.description}")
                     if tool.author:
                         st.markdown(f"**Author:** {tool.author}")
+                    origin = "Live session" if tool.name in runtime_names else "tools directory"
+                    st.caption(f"Origin: {origin}")
                     st.code(json.dumps(tool.parameters, indent=2))
 
     return {
@@ -213,8 +233,205 @@ def init_session_state() -> None:
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    if "tool_specs" not in st.session_state:
-        st.session_state.tool_specs = load_tools()
+    if "file_tools" not in st.session_state:
+        st.session_state.file_tools = load_tools()
+    if "runtime_tools" not in st.session_state:
+        st.session_state.runtime_tools = {}
+    st.session_state.tool_specs = {**st.session_state.file_tools, **st.session_state.runtime_tools}
+    if "system_prompt" not in st.session_state:
+        st.session_state.system_prompt = DEFAULT_SYSTEM_PROMPT
+    if "builder_name" not in st.session_state:
+        st.session_state.builder_name = "runtime_tool"
+    if "builder_description" not in st.session_state:
+        st.session_state.builder_description = "Describe what your tool does."
+    if "builder_parameters" not in st.session_state:
+        st.session_state.builder_parameters = json.dumps(
+            {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+            indent=2,
+        )
+    if "builder_code" not in st.session_state:
+        st.session_state.builder_code = (
+            "def run_tool(args: dict) -> str:\n"
+            "    \"\"\"Return a friendly greeting using the provided arguments.\"\"\"\n"
+            "    name = args.get('name', 'there')\n"
+            "    return f'Hello, {name}! This response came from a runtime tool.'\n"
+        )
+    if "builder_test_args" not in st.session_state:
+        st.session_state.builder_test_args = json.dumps({"name": "Streamlit"}, indent=2)
+    if "builder_validation_state" not in st.session_state:
+        st.session_state.builder_validation_state = None
+    if "builder_validation_message" not in st.session_state:
+        st.session_state.builder_validation_message = None
+    if "builder_validation_preview" not in st.session_state:
+        st.session_state.builder_validation_preview = None
+    if "builder_validated_tool" not in st.session_state:
+        st.session_state.builder_validated_tool = None
+    if "builder_validated_snapshot" not in st.session_state:
+        st.session_state.builder_validated_snapshot = None
+
+
+def validate_runtime_tool(
+    name: str,
+    description: str,
+    parameters_text: str,
+    code: str,
+    test_args_text: str,
+) -> Tuple[ToolSpec, str]:
+    """Validate a runtime tool definition and return its spec and test output."""
+
+    if not name.strip():
+        raise ValueError("Tool name is required.")
+
+    try:
+        parameters = json.loads(parameters_text) if parameters_text.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise ValueError("Parameters must be valid JSON.") from exc
+    if not isinstance(parameters, dict):
+        raise ValueError("Parameters JSON must describe an object schema.")
+
+    namespace: Dict[str, Any] = {}
+    try:
+        exec(code, {}, namespace)  # noqa: S102 - exec is required for the live tool editor
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Tool code failed to execute: {exc}") from exc
+
+    run_callable = namespace.get("run_tool")
+    if run_callable is None or not callable(run_callable):
+        raise ValueError("Define a callable `run_tool(args: dict)` function in the snippet.")
+
+    try:
+        test_args = json.loads(test_args_text) if test_args_text.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise ValueError("Test arguments must be valid JSON.") from exc
+    if not isinstance(test_args, dict):
+        raise ValueError("Test arguments must be a JSON object.")
+
+    try:
+        preview_result = run_callable(test_args)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Tool execution raised an error: {exc}") from exc
+
+    if not isinstance(preview_result, str):
+        preview_render = json.dumps(preview_result, ensure_ascii=False, indent=2)
+    else:
+        preview_render = preview_result
+
+    tool_spec = ToolSpec(
+        name=name.strip(),
+        description=description.strip() or "Runtime tool",
+        parameters=parameters,
+        run=run_callable,
+    )
+
+    return tool_spec, preview_render
+
+
+def render_tool_workshop() -> None:
+    """Render the live tool editor and handle validation/addition workflow."""
+
+    st.subheader("🛠️ Tool Workshop")
+    st.caption(
+        "Author Python helpers at runtime. Define a `run_tool(args: dict)` function, "
+        "validate it with sample input, then add it to this session's toolset."
+    )
+
+    name = st.text_input("Tool Name", key="builder_name")
+    description = st.text_input("Description", key="builder_description")
+    parameters_text = st.text_area(
+        "JSON Schema Parameters",
+        key="builder_parameters",
+        height=160,
+        help="Provide the JSON schema describing the tool arguments (as used by the OpenAI API).",
+    )
+    test_args_text = st.text_area(
+        "Test Arguments (JSON)",
+        key="builder_test_args",
+        height=120,
+        help="Sample payload that will be sent to `run_tool` during validation.",
+    )
+    code = st.text_area(
+        "Tool Code",
+        key="builder_code",
+        height=240,
+        help="Write a Python snippet that defines a `run_tool(args: dict)` function.",
+    )
+
+    current_snapshot = (name, description, parameters_text, code)
+    stored_snapshot = st.session_state.builder_validated_snapshot
+    if stored_snapshot and stored_snapshot != current_snapshot:
+        st.session_state.builder_validated_tool = None
+        st.session_state.builder_validation_state = None
+        st.session_state.builder_validation_message = None
+        st.session_state.builder_validation_preview = None
+        st.session_state.builder_validated_snapshot = None
+
+    validate_clicked = st.button("Validate Tool", type="primary")
+    add_clicked = st.button(
+        "Add Tool",
+        disabled=st.session_state.builder_validated_tool is None,
+    )
+
+    if validate_clicked:
+        try:
+            tool_spec, preview = validate_runtime_tool(
+                name=name,
+                description=description,
+                parameters_text=parameters_text,
+                code=code,
+                test_args_text=test_args_text,
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.session_state.builder_validated_tool = None
+            st.session_state.builder_validation_state = "error"
+            st.session_state.builder_validation_message = str(exc)
+            st.session_state.builder_validation_preview = traceback.format_exc()
+            st.session_state.builder_validated_snapshot = None
+        else:
+            st.session_state.builder_validated_tool = tool_spec
+            st.session_state.builder_validation_state = "success"
+            st.session_state.builder_validation_message = (
+                "Tool validated successfully. Review the preview output below."
+            )
+            st.session_state.builder_validation_preview = preview
+            st.session_state.builder_validated_snapshot = current_snapshot
+
+    if add_clicked and st.session_state.builder_validated_tool is not None:
+        tool = st.session_state.builder_validated_tool
+        if tool.name in st.session_state.tool_specs:
+            st.session_state.builder_validation_state = "error"
+            st.session_state.builder_validation_message = (
+                f"A tool named '{tool.name}' already exists. Choose another name."
+            )
+            st.session_state.builder_validation_preview = None
+        else:
+            st.session_state.runtime_tools[tool.name] = tool
+            st.session_state.tool_specs = {
+                **st.session_state.file_tools,
+                **st.session_state.runtime_tools,
+            }
+            st.session_state.builder_validation_state = "success"
+            st.session_state.builder_validation_message = (
+                f"Tool '{tool.name}' added. It is now available for the assistant."
+            )
+            st.session_state.builder_validation_preview = None
+            st.session_state.builder_validated_tool = None
+            st.session_state.builder_validated_snapshot = None
+
+    status = st.session_state.builder_validation_state
+    message = st.session_state.builder_validation_message
+    preview = st.session_state.builder_validation_preview
+    if status == "success" and message:
+        st.success(message)
+        if preview:
+            st.code(preview, language="text")
+    elif status == "error" and message:
+        st.error(message)
+        if preview:
+            st.code(preview, language="python")
 
 
 def main() -> None:
@@ -253,7 +470,9 @@ def main() -> None:
             try:
                 reply = stream_openai_response(
                     api_key=api_key,
-                    base_messages=st.session_state.messages,
+                    base_messages=
+                        [{"role": "system", "content": st.session_state.system_prompt}]
+                        + st.session_state.messages,
                     tools=st.session_state.tool_specs,
                     model=config["model"],
                     temperature=config["temperature"],
@@ -265,6 +484,9 @@ def main() -> None:
             placeholder.markdown(reply)
 
         st.session_state.messages.append({"role": "assistant", "content": reply})
+
+    st.divider()
+    render_tool_workshop()
 
 
 if __name__ == "__main__":
