@@ -8,6 +8,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+
+# Configure Streamlit runtime for hosting platforms like Railway where the
+# application must bind to the provided ``PORT`` on all interfaces. The
+# variables only take effect if Streamlit is launched via ``streamlit run``,
+# which is how the project is deployed. Setting sensible defaults here avoids
+# having to duplicate the configuration in multiple deploy targets.
+os.environ.setdefault("STREAMLIT_SERVER_ADDRESS", "0.0.0.0")
+if "PORT" in os.environ:
+    os.environ.setdefault("STREAMLIT_SERVER_PORT", os.environ["PORT"])
+os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+
 import streamlit as st
 
 from toolkit import ToolSpec
